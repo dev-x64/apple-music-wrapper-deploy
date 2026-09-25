@@ -104,28 +104,46 @@ login() {
 }
 update_wrapper() {
   require_root
-  local previous_image previous_commit current_commit
-  previous_commit="$(git -C "$APP_DIR/upstream" rev-parse HEAD)"
+  local previous_image previous_commit current_commit staging previous_is_artifact=0
+  if [[ -f "$APP_DIR/upstream/.source-commit" ]]; then
+    previous_commit="$(cat "$APP_DIR/upstream/.source-commit")"
+    previous_is_artifact=1
+  else
+    previous_commit="$(git -C "$APP_DIR/upstream" rev-parse HEAD)"
+  fi
   previous_image="$(docker image inspect apple-music-wrapper:local --format '{{.Id}}')"
-  git -C "$APP_DIR/upstream" pull --ff-only origin lite
-  current_commit="$(git -C "$APP_DIR/upstream" rev-parse HEAD)"
-  if [[ "$previous_commit" == "$current_commit" ]]; then
+  staging="$(mktemp -d "$APP_DIR/.upstream-update.XXXXXX")"
+  if ! "$APP_DIR/download-upstream.sh" "$staging/package"; then
+    rm -rf "$staging"
+    die "download failed; existing container remains unchanged"
+  fi
+  current_commit="$(cat "$staging/package/.source-commit")"
+  if [[ "$previous_is_artifact" == 1 && "$previous_commit" == "$current_commit" ]]; then
     echo "Upstream already current: ${current_commit:0:12}"
+    rm -rf "$staging"
     test_wrapper
     return
   fi
-  echo "Building upstream ${current_commit:0:12}..."
+  mv "$APP_DIR/upstream" "$staging/previous"
+  mv "$staging/package" "$APP_DIR/upstream"
+  echo "Building prebuilt upstream ${current_commit:0:12}..."
   if ! compose build wrapper; then
-    git -C "$APP_DIR/upstream" reset --hard "$previous_commit" >/dev/null
+    rm -rf "$APP_DIR/upstream"
+    mv "$staging/previous" "$APP_DIR/upstream"
+    rm -rf "$staging"
+    docker tag "$previous_image" apple-music-wrapper:local
     die "build failed; existing container remains unchanged"
   fi
   if ! compose up -d --force-recreate wrapper || ! wait_ready || ! test_wrapper; then
-    echo "Update failed; restoring previous image and source..." >&2
+    echo "Update failed; restoring previous image and package..." >&2
     docker tag "$previous_image" apple-music-wrapper:local
-    git -C "$APP_DIR/upstream" reset --hard "$previous_commit" >/dev/null
+    rm -rf "$APP_DIR/upstream"
+    mv "$staging/previous" "$APP_DIR/upstream"
+    rm -rf "$staging"
     compose up -d --force-recreate wrapper || true
     die "update rolled back; run 'wrapper status' and 'wrapper logs'"
   fi
+  rm -rf "$staging"
   echo "Updated ${previous_commit:0:12} -> ${current_commit:0:12}"
 }
 usage() {
@@ -135,7 +153,7 @@ Usage: wrapper <command>
   wrapper status                  Check the container's authenticated regions
   wrapper logs [--follow]         Show the last 100 container log lines
   wrapper login [USER [PASSWORD]] Log in; prompts for missing values and 2FA
-  wrapper update                  Pull upstream lite, rebuild, restart and test
+  wrapper update                  Download built lite, restart and test
   wrapper test [TRACK_ID]         Check /status and a real /m3u8 request
 EOF
 }

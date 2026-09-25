@@ -2,7 +2,6 @@
 set -Eeuo pipefail
 
 DEPLOY_REPO_URL="${WRAPPER_DEPLOY_REPO_URL:-https://github.com/dev-x64/apple-music-wrapper-deploy.git}"
-UPSTREAM_REPO_URL="https://github.com/WorldObservationLog/wrapper.git"
 APP_DIR="${WRAPPER_INSTALL_DIR:-/opt/apple-music-wrapper}"
 PORT="${WRAPPER_PORT:-12340}"
 TEST_ADAM_ID="${WRAPPER_TEST_ADAM_ID:-1608815075}"
@@ -77,7 +76,8 @@ source_dir=""
 script_path="${BASH_SOURCE[0]}"
 if [[ -f "$script_path" ]]; then
   candidate="$(cd "$(dirname "$script_path")" && pwd)"
-  if [[ -f "$candidate/wrapper" && -f "$candidate/Dockerfile.template" &&
+  if [[ -f "$candidate/wrapper" && -f "$candidate/download-upstream.sh" &&
+        -f "$candidate/Dockerfile.template" &&
         -f "$candidate/compose.yaml.template" ]]; then
     source_dir="$candidate"
   fi
@@ -92,9 +92,13 @@ fi
 install -d -m 0755 "$APP_DIR"
 install -d -m 0700 "$APP_DIR/data"
 touch "$APP_DIR/.wrapper-deploy-managed"
-if [[ ! -d "$APP_DIR/upstream/.git" ]]; then
-  echo "Downloading wrapper-lite source from GitHub..."
-  git clone --depth 1 --branch lite "$UPSTREAM_REPO_URL" "$APP_DIR/upstream"
+install -m 0755 "$source_dir/download-upstream.sh" "$APP_DIR/download-upstream.sh"
+if [[ ! -f "$APP_DIR/upstream/.source-commit" ]]; then
+  "$APP_DIR/download-upstream.sh" "$APP_DIR/upstream.download"
+  if [[ -e "$APP_DIR/upstream" ]]; then
+    mv "$APP_DIR/upstream" "$APP_DIR/upstream.source-backup.$(date +%s)"
+  fi
+  mv "$APP_DIR/upstream.download" "$APP_DIR/upstream"
 fi
 install -m 0644 "$source_dir/Dockerfile.template" "$APP_DIR/Dockerfile"
 install -m 0644 "$source_dir/compose.yaml.template" "$APP_DIR/compose.yaml"
@@ -106,7 +110,7 @@ printf 'APP_DIR=%q\nPORT=%q\nTEST_ADAM_ID=%q\n' \
   "$APP_DIR" "$PORT" "$TEST_ADAM_ID" > "$CONFIG_FILE"
 chmod 0644 "$CONFIG_FILE"
 
-echo "Building Docker image (the first build downloads the Android NDK)..."
+echo "Building Docker image from the prebuilt lite package..."
 docker compose --project-directory "$APP_DIR" --env-file "$APP_DIR/.env" \
   -f "$APP_DIR/compose.yaml" -p apple-music-wrapper build wrapper
 

@@ -1,32 +1,10 @@
-FROM debian:13.2 AS build
-
-ARG NDK_VERSION=23
-WORKDIR /app
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential cmake unzip git lsb-release gnupg aria2 wget ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# Keep the NDK in a separate layer: a wrapper source update reuses this download.
-RUN bash -c "$(wget -qO- https://apt.llvm.org/llvm.sh)"
-RUN aria2c -o android-ndk-r${NDK_VERSION}b-linux.zip \
-    https://dl.google.com/android/repository/android-ndk-r${NDK_VERSION}b-linux.zip \
-    && unzip -q android-ndk-r${NDK_VERSION}b-linux.zip \
-    && rm android-ndk-r${NDK_VERSION}b-linux.zip
-
-COPY upstream/ /app/
-RUN cmake -S /app -B /app/build -DCMAKE_BUILD_TYPE=Release -DBUILD_HOST_LAUNCHERS=ON \
-    && cmake --build /app/build --target wrapper_lite_exe wrapper_lite_rootless_exe -j"$(nproc)" \
-    && cmake --build /app/build -j"$(nproc)"
-
 FROM debian:13.2
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=build /app/wrapper-lite-rootless /app/wrapper-lite-rootless
-COPY --from=build /app/rootfs /app/rootfs
-RUN chmod +x /app/wrapper-lite-rootless
+COPY upstream/wrapper-lite-rootless /app/wrapper-lite-rootless
+COPY upstream/rootfs /app/rootfs
+RUN chmod +x /app/wrapper-lite-rootless /app/rootfs/system/bin/lite
 EXPOSE 12340
 ENTRYPOINT ["/app/wrapper-lite-rootless"]
 CMD ["--base-dir", "/data", "--host", "0.0.0.0", "--port", "12340"]

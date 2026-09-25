@@ -2,6 +2,7 @@ services:
   wrapper:
     image: apple-music-wrapper:local
     container_name: wrapper
+    platform: linux/amd64
     build:
       context: .
       dockerfile: Dockerfile
