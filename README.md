@@ -1,10 +1,10 @@
-# Apple Music wrapper: установка в Docker
+# Apple Music wrapper: Docker deployment
 
-Установщик для нового сервера Ubuntu 22.04/24.04 x86_64. Он скачивает готовый пакет сборки [WorldObservationLog/wrapper, ветка `lite`](https://github.com/WorldObservationLog/wrapper/tree/lite), создаёт Docker-образ, запрашивает Apple ID и пароль, открывает порт через UFW и проверяет `/status` и `/m3u8`. Контейнер называется `wrapper`.
+An installer for a new Ubuntu 22.04/24.04 x86_64 server. It downloads the prebuilt package for the [`lite` branch of WorldObservationLog/wrapper](https://github.com/WorldObservationLog/wrapper/tree/lite), creates a Docker image, prompts for an Apple ID and password, opens the port with UFW, and checks `/status` and `/m3u8`. The container is named `wrapper`.
 
-## Быстрый старт
+## Quick start
 
-На **новом** сервере с доступом `sudo`:
+On a **new** server with `sudo` access:
 
 ```bash
 git clone https://github.com/dev-x64/apple-music-wrapper-deploy.git
@@ -12,67 +12,67 @@ cd apple-music-wrapper-deploy
 sudo bash install.sh
 ```
 
-Если Git ещё не установлен:
+If Git is not installed yet:
 
 ```bash
 sudo apt-get update && sudo apt-get install -y git
 ```
 
-Установщик сам поставит Docker Engine и Compose из [официального репозитория Docker](https://docs.docker.com/engine/install/ubuntu/), если Docker отсутствует. Пакет `wrapper-lite-linux-x86_64` создаётся GitHub Actions из ветки `lite`. GitHub требует авторизацию для прямого скачивания Actions-артефактов, поэтому файл доставляется через [nightly.link](https://nightly.link/) по ссылке на конкретный запуск; установщик сравнивает SHA-256 файла с контрольной суммой GitHub API. Сборка Android NDK на сервере не требуется.
+The installer sets up Docker Engine and Compose from [Docker's official repository](https://docs.docker.com/engine/install/ubuntu/) if needed. GitHub Actions builds the `wrapper-lite-linux-x86_64` package from the `lite` branch. GitHub requires authentication to download Actions artifacts directly, so the installer retrieves the artifact through [nightly.link](https://nightly.link/) using a link to a specific workflow run. It verifies the downloaded file's SHA-256 against the digest provided by the GitHub API. The server does not need to build the Android NDK.
 
-При входе пароль вводится без отображения. Если Apple запросит двухфакторный код, введите его в интерактивном терминале. После установки команда `wrapper` доступна из любого каталога.
+The password is hidden while you type it. If Apple requests a two-factor authentication code, enter it in the interactive terminal. After installation, the `wrapper` command is available from any directory.
 
-## Команды
+## Commands
 
 ```bash
-wrapper status                 # Проверить /status и доступные регионы
-sudo wrapper logs              # Последние 100 строк журнала
-sudo wrapper logs --follow     # Следить за журналом
-sudo wrapper login             # Запросить Apple ID и пароль скрытым вводом
-sudo wrapper login USER        # Запросить только пароль
-sudo wrapper login USER PASS   # Передать оба параметра
-sudo wrapper update            # Скачать готовую lite, обновить образ и проверить
-wrapper test                   # /status + /m3u8 тестового трека
-wrapper test 1608815075        # Тест с конкретным Apple Music track ID
+wrapper status                 # Check /status and available storefront regions
+sudo wrapper logs              # Show the last 100 log lines
+sudo wrapper logs --follow     # Follow the logs
+sudo wrapper login             # Prompt for Apple ID and a hidden password
+sudo wrapper login USER        # Prompt for the password only
+sudo wrapper login USER PASS   # Pass both values as arguments
+sudo wrapper update            # Download a prebuilt lite package, update and test the image
+wrapper test                   # Check /status and /m3u8 for the default test track
+wrapper test 1608815075        # Test a specific Apple Music track ID
 ```
 
-Для `wrapper login USER PASS` пароль остаётся в истории команд оболочки и кратковременно виден в списке процессов. Используйте `sudo wrapper login` или `sudo wrapper login USER`, если это нежелательно. Пароль не записывается в Compose, Dockerfile, репозиторий или конфигурационный файл; сохраняется только состояние входа, созданное upstream wrapper.
+With `wrapper login USER PASS`, the password remains in your shell history and is briefly visible in the process list. Use `sudo wrapper login` or `sudo wrapper login USER` to avoid this. The password is not stored in Compose, the Dockerfile, the repository, or a configuration file. Only the login state created by the upstream wrapper is stored.
 
-`wrapper update` берёт последнюю **успешную сборку** upstream-ветки `lite`, а не обновляет этот установщик. При ошибке скачивания, контрольной суммы, сборки Docker-образа или проверки сервиса команда вернёт прежний образ и пакет. Данные аккаунта в `/opt/apple-music-wrapper/data` сохраняются. Если новый коммит ещё не прошёл GitHub Actions, повторите команду позже.
+`wrapper update` downloads the latest **successful build** of the upstream `lite` branch; it does not update this installer. If the download, checksum, Docker build, or service check fails, it restores the previous image and package. Account data in `/opt/apple-music-wrapper/data` is preserved. If a new commit has not passed GitHub Actions yet, try the command again later.
 
-## Настройки
+## Configuration
 
-Переменные задаются перед запуском `install.sh`:
+Set these environment variables before running `install.sh`:
 
-| Переменная | По умолчанию | Назначение |
+| Variable | Default | Purpose |
 |---|---|---|
-| `WRAPPER_PORT` | `12340` | Порт HTTP API и правило UFW |
-| `WRAPPER_INSTALL_DIR` | `/opt/apple-music-wrapper` | Каталог установки |
-| `WRAPPER_TEST_ADAM_ID` | `1608815075` | ID трека для проверки `/m3u8`; `0` пропускает её |
+| `WRAPPER_PORT` | `12340` | HTTP API port and UFW rule |
+| `WRAPPER_INSTALL_DIR` | `/opt/apple-music-wrapper` | Installation directory |
+| `WRAPPER_TEST_ADAM_ID` | `1608815075` | Track ID for the `/m3u8` check; `0` skips it |
 
-Пример:
+Example:
 
 ```bash
 sudo WRAPPER_PORT=12341 WRAPPER_TEST_ADAM_ID=1608815075 bash install.sh
 ```
 
-Для подключения клиента укажите `http://IP_СЕРВЕРА:12340` как адрес wrapper-lite. Например, в `amdl` это параметр `lite-server`.
+Point your client to `http://SERVER_IP:12340` as the wrapper-lite address. For example, in `amdl`, set `lite-server` to this URL.
 
-## Как устроено
+## How it works
 
-- `/opt/apple-music-wrapper/upstream` — распакованный готовый пакет `lite` и SHA коммита в `.source-commit`.
-- `/opt/apple-music-wrapper/Dockerfile` и `compose.yaml` — создаются из шаблонов этого репозитория.
-- `/opt/apple-music-wrapper/data` — постоянные данные аккаунта; права `0700`.
-- `/etc/apple-music-wrapper.conf` — путь, порт и ID тестового трека; секретов нет.
-- `/usr/local/bin/wrapper` — CLI для управления.
+- `/opt/apple-music-wrapper/upstream` contains the unpacked prebuilt `lite` package and its commit SHA in `.source-commit`.
+- `/opt/apple-music-wrapper/Dockerfile` and `compose.yaml` are created from templates in this repository.
+- `/opt/apple-music-wrapper/data` holds persistent account data and has `0700` permissions.
+- `/etc/apple-music-wrapper.conf` contains the installation path, port, and test track ID; it contains no secrets.
+- `/usr/local/bin/wrapper` is the management CLI.
 
-Контейнер использует `network_mode: host` и `privileged: true`: upstream rootless launcher создаёт namespace и монтирует `/proc`. При обычной публикации порта Docker может [обойти правила UFW](https://docs.docker.com/engine/install/ubuntu/#firewall-limitations); с host networking входящий трафик идёт через правила хоста. Установщик разрешает обнаруженные SSH-порты до включения UFW, затем разрешает порт wrapper. API wrapper не имеет собственного пароля: открытый порт доступен извне. Такой контейнер запускайте только на доверенном сервере; при необходимости ограничьте правило UFW конкретными IP клиентов.
+The container uses `network_mode: host` and `privileged: true` because the upstream rootless launcher creates a namespace and mounts `/proc`. With standard Docker port publishing, Docker can [bypass UFW rules](https://docs.docker.com/engine/install/ubuntu/#firewall-limitations). Host networking lets incoming traffic pass through the host's firewall rules. The installer allows detected SSH ports before enabling UFW, then allows the wrapper port. The wrapper API has no built-in password: anyone who can reach the open port can use it. Run it on a trusted server and, if needed, restrict the UFW rule to your clients' IP addresses.
 
-Проверка установки требует успешного `/status` с хотя бы одним регионом и успешного `/m3u8` для тестового трека. Если этот трек недоступен в регионе аккаунта, задайте другой `WRAPPER_TEST_ADAM_ID` или `0` для проверки только статуса. `wrapper test TRACK_ID` можно запустить позже.
+The installation check requires a successful `/status` response with at least one region and a successful `/m3u8` response for the test track. If the track is unavailable in your account's region, set a different `WRAPPER_TEST_ADAM_ID`, or set it to `0` to check status only. You can run `wrapper test TRACK_ID` later.
 
-## Если установка прервалась
+## If installation is interrupted
 
-Повторите `sudo bash install.sh`: установщик продолжит собственную незавершённую установку. Он не перезаписывает чужой каталог `/opt/apple-music-wrapper` без своего маркера.
+Run `sudo bash install.sh` again to resume an incomplete installation created by this installer. It will not overwrite an unrelated `/opt/apple-music-wrapper` directory unless the installer marker is present.
 
 ```bash
 wrapper status
@@ -80,17 +80,17 @@ sudo wrapper logs
 sudo docker ps --filter name=wrapper
 ```
 
-Если `/status` отвечает, а `/m3u8` нет, проверьте подписку, регион аккаунта и ID трека. Если вход не прошёл, запустите `sudo wrapper login` ещё раз. Код и бинарные зависимости wrapper принадлежат [upstream-проекту](https://github.com/WorldObservationLog/wrapper/tree/lite); этот репозиторий содержит только сценарии установки и управления.
+If `/status` works but `/m3u8` does not, check the subscription, account region, and track ID. If login failed, run `sudo wrapper login` again. The wrapper code and binaries belong to the [upstream project](https://github.com/WorldObservationLog/wrapper/tree/lite); this repository contains only installation and management scripts.
 
-Для перехода с ранней версии этого установщика, которая собирала `lite` из исходников, снова запустите `sudo bash install.sh` из свежего клона репозитория. Установщик сохранит каталог `data` и заменит старый исходный код готовым пакетом. Затем используйте `sudo wrapper update`.
+To migrate from an earlier version of this installer that built `lite` from source, run `sudo bash install.sh` from a fresh clone of this repository. The installer preserves the `data` directory and replaces the old source tree with the prebuilt package. After that, use `sudo wrapper update`.
 
-## Проверки разработчика
+## Developer checks
 
 ```bash
 bash -n install.sh wrapper download-upstream.sh
 bash tests/run.sh
 ```
 
-## Лицензия
+## License
 
-Сценарии этого репозитория: MIT. Исходный wrapper: [MIT](https://github.com/WorldObservationLog/wrapper/blob/lite/LICENSE). Репозиторий не содержит Apple ID, пароль или данные входа.
+The scripts in this repository are MIT-licensed. The upstream wrapper is also [MIT-licensed](https://github.com/WorldObservationLog/wrapper/blob/lite/LICENSE). This repository contains no Apple ID, password, or login data.
