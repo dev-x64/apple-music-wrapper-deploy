@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CONFIG_FILE="${WRAPPER_CONFIG_FILE:-/etc/apple-music-wrapper.conf}"
+if [[ ! -r "$CONFIG_FILE" ]]; then
+  echo "wrapper is not installed: $CONFIG_FILE is missing" >&2
+  exit 1
+fi
+# The installer creates this root-owned file with only paths, a port and a test ID.
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+APP_DIR="${APP_DIR:?APP_DIR is missing from config}"
+PORT="${PORT:-12340}"
+TEST_ADAM_ID="${TEST_ADAM_ID:-1608815075}"
+
+die() { echo "wrapper: $*" >&2; exit 1; }
+require_root() { [[ $EUID -eq 0 ]] || die "run this command with sudo"; }
+compose() {
+  docker compose --project-directory "$APP_DIR" --env-file "$APP_DIR/.env" \
+    -f "$APP_DIR/compose.yaml" -p apple-music-wrapper "$@"
+}
+status_json() {
+  curl --noproxy '*' --fail --silent --show-error --max-time 12 \
+    "http://127.0.0.1:${PORT}/status"
+}
+check_status() {
+  local response
+  response="$(status_json)" || return 1
+  printf '%s' "$response" | python3 -c '
+import json, sys
+try:
+    payload = json.load(sys.stdin)
+    regions = payload.get("data", {}).get("regions", [])
+    if payload.get("code") != 0 or not regions:
+        raise ValueError("no authenticated storefront regions")
+    print("OK: " + ", ".join(regions))
+except (ValueError, TypeError, AttributeError, KeyError) as error:
+    print("wrapper status failed: " + str(error), file=sys.stderr)
+    sys.exit(1)
+'
+}
+wait_ready() {
+  local attempt
+  for ((attempt=1; attempt<=60; attempt++)); do
+    if check_status >/dev/null 2>&1; then return 0; fi
+    sleep 3
+  done
+  return 1
+}
+test_wrapper() {
+  local adam_id="${1:-$TEST_ADAM_ID}" response
+  echo "Checking /status..."
+  check_status || return 1
+  if [[ "$adam_id" == 0 ]]; then
+    echo "Playback probe skipped (test track ID is 0)."
+    return 0
+  fi
+  [[ "$adam_id" =~ ^[0-9]+$ ]] || die "test track ID must be numeric"
+  echo "Checking /m3u8 for track $adam_id..."
+  response="$(curl --noproxy '*' --fail --silent --show-error --max-time 30 \
+    --get --data-urlencode "adamId=$adam_id" \
+    "http://127.0.0.1:${PORT}/m3u8")" || return 1
+  printf '%s' "$response" | python3 -c '
+import json, sys
+try:
+    payload = json.load(sys.stdin)
+    if payload.get("code") != 0 or not payload.get("data"):
+        raise ValueError(payload.get("msg", "empty playlist response"))
+    print("OK: playback manifest received")
+except (ValueError, TypeError, AttributeError) as error:
+    print("wrapper playback test failed: " + str(error), file=sys.stderr)
+    sys.exit(1)
+'
+}
+login() {
+  require_root
+  [[ -t 0 ]] || die "login needs an interactive terminal for the password and possible 2FA code"
+  local username="${1:-}" password="${2:-}"
+  [[ $# -le 2 ]] || die "usage: wrapper login [USER [PASSWORD]]"
+  if [[ -z "$username" ]]; then read -r -p "Apple ID: " username; fi
+  if [[ -z "$password" ]]; then
+    read -r -s -p "Password: " password
+    echo
+  fi
+  [[ -n "$username" && -n "$password" ]] || die "Apple ID and password are required"
+  [[ "$username" != *:* ]] || die "Apple ID must not contain ':'"
+
+  echo "Stopping wrapper while the account database is updated..."
+  compose stop wrapper >/dev/null 2>&1 || true
+  echo "Logging in; enter the 2FA code if requested..."
+  if ! docker run --rm -it --network host --privileged \
+      -v "$APP_DIR/data:/app/rootfs/data" \
+      --entrypoint /app/wrapper-lite-rootless apple-music-wrapper:local \
+      --login "$username:$password" --base-dir /data; then
+    unset password
+    echo "Login failed. Trying to restart the previous session..." >&2
+    compose up -d wrapper >/dev/null || true
+    return 1
+  fi
+  unset password
+  compose up -d wrapper
+  wait_ready || die "login finished, but /status is not ready; run 'wrapper logs'"
+  test_wrapper
+}
+update_wrapper() {
+  require_root
+  local previous_image previous_commit current_commit
+  previous_commit="$(git -C "$APP_DIR/upstream" rev-parse HEAD)"
+  previous_image="$(docker image inspect apple-music-wrapper:local --format '{{.Id}}')"
+  git -C "$APP_DIR/upstream" pull --ff-only origin lite
+  current_commit="$(git -C "$APP_DIR/upstream" rev-parse HEAD)"
+  if [[ "$previous_commit" == "$current_commit" ]]; then
+    echo "Upstream already current: ${current_commit:0:12}"
+    test_wrapper
+    return
+  fi
+  echo "Building upstream ${current_commit:0:12}..."
+  if ! compose build wrapper; then
+    git -C "$APP_DIR/upstream" reset --hard "$previous_commit" >/dev/null
+    die "build failed; existing container remains unchanged"
+  fi
+  if ! compose up -d --force-recreate wrapper || ! wait_ready || ! test_wrapper; then
+    echo "Update failed; restoring previous image and source..." >&2
+    docker tag "$previous_image" apple-music-wrapper:local
+    git -C "$APP_DIR/upstream" reset --hard "$previous_commit" >/dev/null
+    compose up -d --force-recreate wrapper || true
+    die "update rolled back; run 'wrapper status' and 'wrapper logs'"
+  fi
+  echo "Updated ${previous_commit:0:12} -> ${current_commit:0:12}"
+}
+usage() {
+  cat <<'EOF'
+Usage: wrapper <command>
+
+  wrapper status                  Check the container's authenticated regions
+  wrapper logs [--follow]         Show the last 100 container log lines
+  wrapper login [USER [PASSWORD]] Log in; prompts for missing values and 2FA
+  wrapper update                  Pull upstream lite, rebuild, restart and test
+  wrapper test [TRACK_ID]         Check /status and a real /m3u8 request
+EOF
+}
+
+command="${1:-}"
+if [[ $# -gt 0 ]]; then shift; fi
+case "$command" in
+  status) [[ $# -eq 0 ]] || die "usage: wrapper status"; check_status ;;
+  logs)
+    require_root
+    case "${1:-}" in
+      "") compose logs --tail 100 wrapper ;;
+      --follow|-f) compose logs --tail 100 -f wrapper ;;
+      *) die "usage: wrapper logs [--follow]" ;;
+    esac
+    ;;
+  login) login "$@" ;;
+  update) [[ $# -eq 0 ]] || die "usage: wrapper update"; update_wrapper ;;
+  test) [[ $# -le 1 ]] || die "usage: wrapper test [TRACK_ID]"; test_wrapper "${1:-}" ;;
+  -h|--help|help|"") usage ;;
+  *) usage >&2; die "unknown command: $command" ;;
+esac

@@ -1,0 +1,6 @@
+upstream/.git
+upstream/build
+upstream/android-ndk-r23b
+upstream/rootfs/data
+data
+*.log
