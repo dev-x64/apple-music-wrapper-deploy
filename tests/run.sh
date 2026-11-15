@@ -49,7 +49,19 @@ exit 0
 EOF
 printf '#!/usr/bin/env bash\nexit 0\n' > "$TEMP_DIR/bin/sleep"
 printf '#!/usr/bin/env bash\nshift\nexec "$@"\n' > "$TEMP_DIR/bin/timeout"
-chmod +x "$TEMP_DIR/bin/docker" "$TEMP_DIR/bin/sleep" "$TEMP_DIR/bin/timeout"
+# iptables/ip6tables mocks: -C succeeds once -I has inserted the rule.
+cat > "$TEMP_DIR/bin/iptables" <<'EOF'
+#!/usr/bin/env bash
+name="$(basename "$0")"
+printf '%s %s\n' "$name" "$*" >> "$MOCK_IPTABLES_LOG"
+case " $* " in
+  *" -C "*) [[ -e "$MOCK_IPTABLES_STATE.$name" ]] ;;
+  *" -I "*) touch "$MOCK_IPTABLES_STATE.$name" ;;
+esac
+EOF
+cp "$TEMP_DIR/bin/iptables" "$TEMP_DIR/bin/ip6tables"
+chmod +x "$TEMP_DIR/bin/docker" "$TEMP_DIR/bin/sleep" "$TEMP_DIR/bin/timeout" \
+  "$TEMP_DIR/bin/iptables" "$TEMP_DIR/bin/ip6tables"
 
 bash -n "$ROOT/install.sh" "$ROOT/wrapper"
 grep -q '@INTERVAL@' "$ROOT/wrapper-watchdog.timer.template"
@@ -117,4 +129,21 @@ printf 'user@example.com\nsecret\n' > "$WRAPPER_CREDENTIALS_FILE"
 "$ROOT/wrapper" forget-credentials >/dev/null
 [[ ! -e "$WRAPPER_CREDENTIALS_FILE" ]] || fail "forget-credentials kept the file"
 
-echo "CLI, watchdog, failure cases, Compose and shell syntax: OK"
+export MOCK_IPTABLES_LOG="$TEMP_DIR/iptables.log"
+export MOCK_IPTABLES_STATE="$TEMP_DIR/iptables-rule"
+rule='INPUT -p tcp --dport 12340 -m comment --comment apple-music-wrapper -j ACCEPT'
+"$ROOT/wrapper" firewall >/dev/null
+grep -q "^iptables -w -I $rule$" "$MOCK_IPTABLES_LOG" || fail "iptables rule not inserted"
+grep -q "^ip6tables -w -I $rule$" "$MOCK_IPTABLES_LOG" || fail "ip6tables rule not inserted"
+: > "$MOCK_IPTABLES_LOG"
+output="$("$ROOT/wrapper" firewall)"
+grep -q 'already allowed' <<<"$output" || fail "existing rule not detected"
+! grep -q -- ' -I ' "$MOCK_IPTABLES_LOG" || fail "rule inserted twice"
+reset_watchdog; rm -f "$MOCK_IPTABLES_STATE".*; : > "$MOCK_IPTABLES_LOG"
+FIREWALL=iptables "$ROOT/wrapper" watchdog run >/dev/null || fail "watchdog failed with iptables"
+grep -q "^iptables -w -I $rule$" "$MOCK_IPTABLES_LOG" || fail "watchdog did not restore the rule"
+: > "$MOCK_IPTABLES_LOG"
+"$ROOT/wrapper" watchdog run >/dev/null
+[[ ! -s "$MOCK_IPTABLES_LOG" ]] || fail "watchdog touched iptables although FIREWALL is not iptables"
+
+echo "CLI, watchdog, firewall, failure cases, Compose and shell syntax: OK"

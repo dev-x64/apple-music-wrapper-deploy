@@ -4,7 +4,7 @@ One-command installer and management CLI for [Apple Music wrapper-lite](https://
 
 **Supported:** Ubuntu 22.04 / 24.04 and Debian 12 / 13, x86_64 — a fresh server or one that already runs other services.
 
-The installer downloads the prebuilt `lite` package, builds a Docker image, prompts for an Apple ID and password, opens the port if UFW is active, checks `/status` and `/m3u8`, and enables a periodic health check. The container is named `wrapper`.
+The installer downloads the prebuilt `lite` package, builds a Docker image, prompts for an Apple ID and password, opens the port in UFW or iptables, checks `/status` and `/m3u8`, and enables a periodic health check. The container is named `wrapper`.
 
 ## Quick start
 
@@ -38,6 +38,7 @@ sudo wrapper login USER PASS   # Pass both values as arguments
 sudo wrapper login --save      # Log in and keep the credentials for automatic re-login
 sudo wrapper forget-credentials  # Delete saved credentials
 sudo wrapper restart           # Recreate the container and test it
+sudo wrapper firewall          # Allow the API port in iptables/ip6tables (idempotent)
 sudo wrapper update            # Download a prebuilt lite package, update and test the image
 wrapper test                   # Check /status and /m3u8 for the default test track
 wrapper test 1608815075        # Test a specific Apple Music track ID
@@ -69,8 +70,8 @@ Set these environment variables before running `install.sh`:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `WRAPPER_PORT` | `12340` | HTTP API port and UFW rule |
-| `WRAPPER_UFW` | `auto` | `auto`: add rules only if UFW is already active; `enable`: install and turn on UFW (SSH and the port allowed); `off`: don't touch the firewall |
+| `WRAPPER_PORT` | `12340` | HTTP API port and firewall rule |
+| `WRAPPER_FIREWALL` | `auto` | `auto`: UFW rule if UFW is active, otherwise iptables rule if iptables is installed; `ufw`: install and turn on UFW (SSH and the port allowed); `iptables`: always use an iptables rule; `off`: don't touch the firewall |
 | `WRAPPER_INSTALL_DIR` | `/opt/apple-music-wrapper` | Installation directory |
 | `WRAPPER_TEST_ADAM_ID` | `1608815075` | Track ID for the `/m3u8` check; `0` skips it |
 | `WRAPPER_WATCHDOG` | `1` | Install and enable the periodic health check; `0` disables it |
@@ -98,7 +99,13 @@ Point your client to `http://SERVER_IP:12340` as the wrapper-lite address. For e
 - `/etc/systemd/system/wrapper-watchdog.service` and `.timer` run the watchdog.
 - `/etc/apple-music-wrapper.credentials` exists only after `wrapper login --save`.
 
-The container uses `network_mode: host` and `privileged: true` because the upstream rootless launcher creates a namespace and mounts `/proc`. With standard Docker port publishing, Docker can [bypass UFW rules](https://docs.docker.com/engine/install/ubuntu/#firewall-limitations). Host networking lets incoming traffic pass through the host's firewall rules. By default (`WRAPPER_UFW=auto`) the installer never changes the firewall state: if UFW is active it allows the wrapper port, otherwise it leaves the firewall alone, so servers running other services are not affected. On a fresh server, `WRAPPER_UFW=enable` installs and turns on UFW after allowing the detected SSH ports and the wrapper port. The wrapper API has no built-in password: anyone who can reach the open port can use it. Run it on a trusted server and, if needed, restrict the UFW rule to your clients' IP addresses.
+The container uses `network_mode: host` and `privileged: true` because the upstream rootless launcher creates a namespace and mounts `/proc`. With standard Docker port publishing, Docker can [bypass UFW rules](https://docs.docker.com/engine/install/ubuntu/#firewall-limitations). Host networking lets incoming traffic pass through the host's firewall rules. By default (`WRAPPER_FIREWALL=auto`) the installer never turns a firewall on, so servers running other services are not affected:
+
+- if UFW is active, it runs `ufw allow PORT/tcp`;
+- otherwise, if `iptables` is installed, it inserts `ACCEPT` for the port at the top of the `INPUT` chain (and in `ip6tables`), tagged with the comment `apple-music-wrapper`. Plain iptables rules are lost on reboot, so the watchdog re-adds the rule on every run (3 minutes after boot, then every 5 minutes); `sudo wrapper firewall` does the same by hand;
+- otherwise it leaves the firewall alone.
+
+On a fresh server, `WRAPPER_FIREWALL=ufw` installs and turns on UFW after allowing the detected SSH ports and the wrapper port. The wrapper API has no built-in password: anyone who can reach the open port can use it. Run it on a trusted server and, if needed, restrict the firewall rule to your clients' IP addresses.
 
 The installation check requires a successful `/status` response with at least one region and a successful `/m3u8` response for the test track. If the track is unavailable in your account's region, set a different `WRAPPER_TEST_ADAM_ID`, or set it to `0` to check status only. You can run `wrapper test TRACK_ID` later.
 

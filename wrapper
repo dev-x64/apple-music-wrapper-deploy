@@ -18,6 +18,7 @@ CREDENTIALS_FILE="${WRAPPER_CREDENTIALS_FILE:-/etc/apple-music-wrapper.credentia
 STATE_DIR="${WRAPPER_STATE_DIR:-/var/lib/apple-music-wrapper}"
 LOCK_FILE="${WRAPPER_LOCK_FILE:-/run/apple-music-wrapper.lock}"
 WATCHDOG_TIMER="wrapper-watchdog.timer"
+FIREWALL="${FIREWALL:-off}"
 
 die() { echo "wrapper: $*" >&2; exit 1; }
 require_root() {
@@ -152,6 +153,24 @@ forget_credentials() {
     echo "No saved credentials."
   fi
 }
+# Allows the API port in iptables/ip6tables. The rule is inserted first in INPUT so it wins
+# over later DROP/REJECT rules; it is tagged with a comment and only added once.
+ensure_iptables() {
+  require_root
+  local cmd found=0 rule=(INPUT -p tcp --dport "$PORT" -m comment --comment apple-music-wrapper -j ACCEPT)
+  for cmd in iptables ip6tables; do
+    command -v "$cmd" >/dev/null 2>&1 || continue
+    found=1
+    if "$cmd" -w -C "${rule[@]}" >/dev/null 2>&1; then
+      echo "$cmd: port $PORT/tcp already allowed"
+    elif "$cmd" -w -I "${rule[@]}"; then
+      echo "$cmd: allowed port $PORT/tcp"
+    else
+      echo "$cmd: could not add a rule for port $PORT/tcp" >&2
+    fi
+  done
+  [[ "$found" == 1 ]] || die "iptables is not installed"
+}
 restart_wrapper() {
   require_root
   take_lock 900 || die "another wrapper operation is still running"
@@ -169,6 +188,8 @@ watchdog_run() {
     echo "another wrapper operation is running; skipping this check"
     return 0
   fi
+  # iptables rules are not persistent, so restore ours after a reboot or a firewall reload.
+  if [[ "$FIREWALL" == iptables ]]; then ensure_iptables | grep -v 'already allowed' || true; fi
   healthy && return 0
   sleep 20
   if healthy; then
@@ -290,6 +311,7 @@ Usage: wrapper <command>
                                   --save keeps the credentials for automatic re-login
   wrapper forget-credentials      Delete saved credentials (disables automatic re-login)
   wrapper restart                 Recreate the container and test it
+  wrapper firewall                Allow the API port in iptables (idempotent)
   wrapper update                  Download built lite, restart and test
   wrapper test [TRACK_ID]         Check /status and a real /m3u8 request
   wrapper watchdog [run|status|enable|disable]
@@ -312,6 +334,7 @@ case "$command" in
   login) login "$@" ;;
   forget-credentials) [[ $# -eq 0 ]] || die "usage: wrapper forget-credentials"; forget_credentials ;;
   restart) [[ $# -eq 0 ]] || die "usage: wrapper restart"; restart_wrapper ;;
+  firewall) [[ $# -eq 0 ]] || die "usage: wrapper firewall"; ensure_iptables ;;
   update) [[ $# -eq 0 ]] || die "usage: wrapper update"; update_wrapper ;;
   test) [[ $# -le 1 ]] || die "usage: wrapper test [TRACK_ID]"; test_wrapper "${1:-}" ;;
   watchdog) [[ $# -le 1 ]] || die "usage: wrapper watchdog [run|status|enable|disable]"; watchdog "$@" ;;

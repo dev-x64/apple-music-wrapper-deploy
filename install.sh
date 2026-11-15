@@ -11,7 +11,14 @@ RELOGIN_COOLDOWN="${WRAPPER_RELOGIN_COOLDOWN:-21600}"
 SAVE_CREDENTIALS="${WRAPPER_SAVE_CREDENTIALS:-0}"
 REPLACE_CONTAINER="${WRAPPER_REPLACE_CONTAINER:-0}"
 IMPORT_DATA="${WRAPPER_IMPORT_DATA:-}"
-UFW_MODE="${WRAPPER_UFW:-auto}"
+FIREWALL_MODE="${WRAPPER_FIREWALL:-}"
+if [[ -z "$FIREWALL_MODE" ]]; then
+  # WRAPPER_UFW=auto|enable|off is the older name of this setting.
+  case "${WRAPPER_UFW:-auto}" in
+    enable) FIREWALL_MODE=ufw ;;
+    *) FIREWALL_MODE="${WRAPPER_UFW:-auto}" ;;
+  esac
+fi
 CONFIG_FILE="/etc/apple-music-wrapper.conf"
 TEMP_DIR=""
 
@@ -42,8 +49,10 @@ fi
   die "WRAPPER_SAVE_CREDENTIALS must be 0 or 1"
 [[ "$REPLACE_CONTAINER" == 0 || "$REPLACE_CONTAINER" == 1 ]] ||
   die "WRAPPER_REPLACE_CONTAINER must be 0 or 1"
-[[ "$UFW_MODE" == auto || "$UFW_MODE" == enable || "$UFW_MODE" == off ]] ||
-  die "WRAPPER_UFW must be auto, enable or off"
+case "$FIREWALL_MODE" in
+  auto|ufw|iptables|off) ;;
+  *) die "WRAPPER_FIREWALL must be auto, ufw, iptables or off" ;;
+esac
 [[ -t 0 ]] || die "an interactive terminal is required for login and possible 2FA"
 
 if [[ -e "$APP_DIR" && ! -e "$APP_DIR/.wrapper-deploy-managed" ]] &&
@@ -61,8 +70,10 @@ fi
 echo "Installing host prerequisites..."
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ca-certificates curl git python3
-if [[ "$UFW_MODE" == enable ]]; then
+if [[ "$FIREWALL_MODE" == ufw ]]; then
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ufw
+elif [[ "$FIREWALL_MODE" == iptables ]] && ! command -v iptables >/dev/null 2>&1; then
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables
 fi
 
 if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
@@ -159,14 +170,28 @@ echo "Building Docker image from the prebuilt lite package..."
 docker compose --project-directory "$APP_DIR" --env-file "$APP_DIR/.env" \
   -f "$APP_DIR/compose.yaml" -p apple-music-wrapper build wrapper
 
-# Firewall. "auto" only adds rules to a UFW that is already active, so the installer never
-# changes the firewall state of a server that runs other services; "enable" also turns UFW
-# on (allowing the detected SSH ports first), which suits a fresh server; "off" skips it.
+# Firewall. "auto" never turns a firewall on, so servers that run other services keep
+# their firewall state: it adds a UFW rule when UFW is active, otherwise an iptables
+# ACCEPT rule when iptables is installed. "ufw" also installs and turns UFW on (allowing
+# the detected SSH ports first), which suits a fresh server. "iptables" forces the
+# iptables rule. "off" leaves the firewall alone.
 ufw_active=0
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
   ufw_active=1
 fi
-if [[ "$UFW_MODE" == enable || ("$UFW_MODE" == auto && "$ufw_active" == 1) ]]; then
+firewall=off
+case "$FIREWALL_MODE" in
+  ufw|iptables) firewall="$FIREWALL_MODE" ;;
+  auto)
+    if [[ "$ufw_active" == 1 ]]; then
+      firewall=ufw
+    elif command -v iptables >/dev/null 2>&1; then
+      firewall=iptables
+    fi
+    ;;
+esac
+printf 'FIREWALL=%q\n' "$firewall" >> "$CONFIG_FILE"
+if [[ "$firewall" == ufw ]]; then
   echo "Opening port $PORT/tcp in UFW..."
   ssh_ports=()
   if [[ -n "${SSH_CONNECTION:-}" ]]; then
@@ -194,9 +219,12 @@ if [[ "$UFW_MODE" == enable || ("$UFW_MODE" == auto && "$ufw_active" == 1) ]]; t
   if [[ "$ufw_active" == 0 ]]; then
     ufw --force enable
   fi
-elif [[ "$UFW_MODE" == auto ]]; then
-  echo "UFW is not active; leaving the firewall unchanged. Make sure port $PORT/tcp is reachable"
-  echo "(or rerun with WRAPPER_UFW=enable to turn UFW on with SSH and port $PORT allowed)."
+elif [[ "$firewall" == iptables ]]; then
+  echo "Allowing port $PORT/tcp in iptables (re-applied by the watchdog after reboots)..."
+  /usr/local/bin/wrapper firewall
+else
+  echo "No active UFW and no iptables found; leaving the firewall unchanged."
+  echo "Make sure port $PORT/tcp is reachable."
 fi
 
 if [[ "$foreign_container" == 1 ]]; then
