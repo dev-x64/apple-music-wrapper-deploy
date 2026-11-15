@@ -11,6 +11,7 @@ RELOGIN_COOLDOWN="${WRAPPER_RELOGIN_COOLDOWN:-21600}"
 SAVE_CREDENTIALS="${WRAPPER_SAVE_CREDENTIALS:-0}"
 REPLACE_CONTAINER="${WRAPPER_REPLACE_CONTAINER:-0}"
 IMPORT_DATA="${WRAPPER_IMPORT_DATA:-}"
+UFW_MODE="${WRAPPER_UFW:-auto}"
 CONFIG_FILE="/etc/apple-music-wrapper.conf"
 TEMP_DIR=""
 
@@ -24,9 +25,10 @@ trap cleanup EXIT
 [[ -r /etc/os-release ]] || die "/etc/os-release is missing"
 # shellcheck source=/dev/null
 source /etc/os-release
-[[ "$ID" == ubuntu ]] || die "this installer currently supports Ubuntu 22.04/24.04"
-[[ "$VERSION_ID" == 22.04 || "$VERSION_ID" == 24.04 ]] ||
-  die "this installer currently supports Ubuntu 22.04/24.04"
+case "${ID:-}:${VERSION_ID:-}" in
+  ubuntu:22.04|ubuntu:24.04|debian:12|debian:13) ;;
+  *) die "this installer supports Ubuntu 22.04/24.04 and Debian 12/13 (found ${PRETTY_NAME:-unknown})" ;;
+esac
 [[ "$APP_DIR" == /* && "$APP_DIR" != / ]] || die "WRAPPER_INSTALL_DIR must be an absolute directory"
 if ! [[ "$PORT" =~ ^[0-9]+$ ]] || ((PORT < 1 || PORT > 65535)); then
   die "invalid WRAPPER_PORT"
@@ -40,6 +42,8 @@ fi
   die "WRAPPER_SAVE_CREDENTIALS must be 0 or 1"
 [[ "$REPLACE_CONTAINER" == 0 || "$REPLACE_CONTAINER" == 1 ]] ||
   die "WRAPPER_REPLACE_CONTAINER must be 0 or 1"
+[[ "$UFW_MODE" == auto || "$UFW_MODE" == enable || "$UFW_MODE" == off ]] ||
+  die "WRAPPER_UFW must be auto, enable or off"
 [[ -t 0 ]] || die "an interactive terminal is required for login and possible 2FA"
 
 if [[ -e "$APP_DIR" && ! -e "$APP_DIR/.wrapper-deploy-managed" ]] &&
@@ -56,16 +60,19 @@ fi
 
 echo "Installing host prerequisites..."
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ca-certificates curl git python3 ufw
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ca-certificates curl git python3
+if [[ "$UFW_MODE" == enable ]]; then
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ufw
+fi
 
 if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
   echo "Configuring Docker's official apt repository..."
   install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  curl -fsSL "https://download.docker.com/linux/$ID/gpg" -o /etc/apt/keyrings/docker.asc
   chmod a+r /etc/apt/keyrings/docker.asc
   cat > /etc/apt/sources.list.d/docker.sources <<EOF
 Types: deb
-URIs: https://download.docker.com/linux/ubuntu
+URIs: https://download.docker.com/linux/$ID
 Suites: ${UBUNTU_CODENAME:-$VERSION_CODENAME}
 Components: stable
 Architectures: $(dpkg --print-architecture)
@@ -152,32 +159,44 @@ echo "Building Docker image from the prebuilt lite package..."
 docker compose --project-directory "$APP_DIR" --env-file "$APP_DIR/.env" \
   -f "$APP_DIR/compose.yaml" -p apple-music-wrapper build wrapper
 
-echo "Opening port $PORT/tcp in UFW..."
-ssh_ports=()
-if [[ -n "${SSH_CONNECTION:-}" ]]; then
-  ssh_ports+=("${SSH_CONNECTION##* }")
+# Firewall. "auto" only adds rules to a UFW that is already active, so the installer never
+# changes the firewall state of a server that runs other services; "enable" also turns UFW
+# on (allowing the detected SSH ports first), which suits a fresh server; "off" skips it.
+ufw_active=0
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+  ufw_active=1
 fi
-if [[ -x /usr/sbin/sshd ]]; then
-  while read -r ssh_port; do ssh_ports+=("$ssh_port"); done < <(
-    /usr/sbin/sshd -T 2>/dev/null | awk '$1 == "port" {print $2}'
-  )
-fi
-if command -v ss >/dev/null 2>&1; then
-  while read -r ssh_port; do ssh_ports+=("$ssh_port"); done < <(
-    ss -ltnp 2>/dev/null | awk '/sshd/ {n=split($4,a,":"); print a[n]}'
-  )
-fi
-ssh_allowed=0
-for ssh_port in "${ssh_ports[@]}"; do
-  if [[ "$ssh_port" =~ ^[0-9]+$ ]] && ((ssh_port >= 1 && ssh_port <= 65535)); then
-    ufw allow "$ssh_port/tcp" comment 'SSH'
-    ssh_allowed=1
+if [[ "$UFW_MODE" == enable || ("$UFW_MODE" == auto && "$ufw_active" == 1) ]]; then
+  echo "Opening port $PORT/tcp in UFW..."
+  ssh_ports=()
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    ssh_ports+=("${SSH_CONNECTION##* }")
   fi
-done
-if [[ "$ssh_allowed" == 0 ]]; then ufw allow 22/tcp comment 'SSH'; fi
-ufw allow "$PORT/tcp" comment 'Apple Music wrapper'
-if ! ufw status | grep -q '^Status: active'; then
-  ufw --force enable
+  if [[ -x /usr/sbin/sshd ]]; then
+    while read -r ssh_port; do ssh_ports+=("$ssh_port"); done < <(
+      /usr/sbin/sshd -T 2>/dev/null | awk '$1 == "port" {print $2}'
+    )
+  fi
+  if command -v ss >/dev/null 2>&1; then
+    while read -r ssh_port; do ssh_ports+=("$ssh_port"); done < <(
+      ss -ltnp 2>/dev/null | awk '/sshd/ {n=split($4,a,":"); print a[n]}'
+    )
+  fi
+  ssh_allowed=0
+  for ssh_port in "${ssh_ports[@]}"; do
+    if [[ "$ssh_port" =~ ^[0-9]+$ ]] && ((ssh_port >= 1 && ssh_port <= 65535)); then
+      ufw allow "$ssh_port/tcp" comment 'SSH'
+      ssh_allowed=1
+    fi
+  done
+  if [[ "$ssh_allowed" == 0 ]]; then ufw allow 22/tcp comment 'SSH'; fi
+  ufw allow "$PORT/tcp" comment 'Apple Music wrapper'
+  if [[ "$ufw_active" == 0 ]]; then
+    ufw --force enable
+  fi
+elif [[ "$UFW_MODE" == auto ]]; then
+  echo "UFW is not active; leaving the firewall unchanged. Make sure port $PORT/tcp is reachable"
+  echo "(or rerun with WRAPPER_UFW=enable to turn UFW on with SSH and port $PORT allowed)."
 fi
 
 if [[ "$foreign_container" == 1 ]]; then
