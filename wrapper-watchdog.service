@@ -1,0 +1,10 @@
+[Unit]
+Description=Apple Music wrapper health check (restart and re-login when needed)
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/wrapper watchdog run
+TimeoutStartSec=20min

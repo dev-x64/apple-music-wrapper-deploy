@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodic Apple Music wrapper health check
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=@INTERVAL@
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

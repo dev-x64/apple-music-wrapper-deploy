@@ -6,18 +6,34 @@ if [[ ! -r "$CONFIG_FILE" ]]; then
   echo "wrapper is not installed: $CONFIG_FILE is missing" >&2
   exit 1
 fi
-# The installer creates this root-owned file with only paths, a port and a test ID.
+# The installer creates this root-owned file with only paths, a port, a test ID
+# and watchdog settings.
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
 APP_DIR="${APP_DIR:?APP_DIR is missing from config}"
 PORT="${PORT:-12340}"
 TEST_ADAM_ID="${TEST_ADAM_ID:-1608815075}"
+RELOGIN_COOLDOWN="${RELOGIN_COOLDOWN:-21600}"
+CREDENTIALS_FILE="${WRAPPER_CREDENTIALS_FILE:-/etc/apple-music-wrapper.credentials}"
+STATE_DIR="${WRAPPER_STATE_DIR:-/var/lib/apple-music-wrapper}"
+LOCK_FILE="${WRAPPER_LOCK_FILE:-/run/apple-music-wrapper.lock}"
+WATCHDOG_TIMER="wrapper-watchdog.timer"
 
 die() { echo "wrapper: $*" >&2; exit 1; }
-require_root() { [[ $EUID -eq 0 ]] || die "run this command with sudo"; }
+require_root() {
+  [[ $EUID -eq 0 || -n "${WRAPPER_TEST_MODE:-}" ]] || die "run this command with sudo"
+}
 compose() {
   docker compose --project-directory "$APP_DIR" --env-file "$APP_DIR/.env" \
     -f "$APP_DIR/compose.yaml" -p apple-music-wrapper "$@"
+}
+# One lock for every command that stops, recreates or logs in the container, so the
+# watchdog never restarts it in the middle of `wrapper login` or `wrapper update`.
+take_lock() {
+  local wait_seconds="$1"
+  command -v flock >/dev/null 2>&1 || return 0
+  exec 9>"$LOCK_FILE"
+  flock -w "$wait_seconds" 9
 }
 status_json() {
   curl --noproxy '*' --fail --silent --show-error --max-time 12 \
@@ -40,8 +56,8 @@ except (ValueError, TypeError, AttributeError, KeyError) as error:
 '
 }
 wait_ready() {
-  local attempt
-  for ((attempt=1; attempt<=60; attempt++)); do
+  local attempts="${1:-60}" attempt
+  for ((attempt=1; attempt<=attempts; attempt++)); do
     if check_status >/dev/null 2>&1; then return 0; fi
     sleep 3
   done
@@ -72,11 +88,36 @@ except (ValueError, TypeError, AttributeError) as error:
     sys.exit(1)
 '
 }
+healthy() { test_wrapper >/dev/null 2>&1; }
+
+# Runs the upstream login against the data volume. The caller stops the service first.
+run_login() {
+  local username="$1" password="$2" interactive="$3"
+  if [[ "$interactive" == 1 ]]; then
+    docker run --rm -it --network host --privileged \
+      -v "$APP_DIR/data:/app/rootfs/data" \
+      --entrypoint /app/wrapper-lite-rootless apple-music-wrapper:local \
+      --login "$username:$password" --base-dir /data
+  else
+    timeout 180 docker run --rm --network host --privileged \
+      -v "$APP_DIR/data:/app/rootfs/data" \
+      --entrypoint /app/wrapper-lite-rootless apple-music-wrapper:local \
+      --login "$username:$password" --base-dir /data </dev/null
+  fi
+}
+save_credentials() {
+  local username="$1" password="$2"
+  (umask 077 && printf '%s\n%s\n' "$username" "$password" > "$CREDENTIALS_FILE")
+  chmod 0600 "$CREDENTIALS_FILE"
+  echo "Credentials saved to $CREDENTIALS_FILE (root only); the watchdog can now re-login."
+}
 login() {
   require_root
+  local save=0
+  if [[ "${1:-}" == --save ]]; then save=1; shift; fi
   [[ -t 0 ]] || die "login needs an interactive terminal for the password and possible 2FA code"
   local username="${1:-}" password="${2:-}"
-  [[ $# -le 2 ]] || die "usage: wrapper login [USER [PASSWORD]]"
+  [[ $# -le 2 ]] || die "usage: wrapper login [--save] [USER [PASSWORD]]"
   if [[ -z "$username" ]]; then read -r -p "Apple ID: " username; fi
   if [[ -z "$password" ]]; then
     read -r -s -p "Password: " password
@@ -84,26 +125,118 @@ login() {
   fi
   [[ -n "$username" && -n "$password" ]] || die "Apple ID and password are required"
   [[ "$username" != *:* ]] || die "Apple ID must not contain ':'"
+  [[ "$username$password" != *$'\n'* ]] || die "Apple ID and password must be single-line"
+  take_lock 900 || die "another wrapper operation is still running"
 
   echo "Stopping wrapper while the account database is updated..."
   compose stop wrapper >/dev/null 2>&1 || true
   echo "Logging in; enter the 2FA code if requested..."
-  if ! docker run --rm -it --network host --privileged \
-      -v "$APP_DIR/data:/app/rootfs/data" \
-      --entrypoint /app/wrapper-lite-rootless apple-music-wrapper:local \
-      --login "$username:$password" --base-dir /data; then
+  if ! run_login "$username" "$password" 1; then
     unset password
     echo "Login failed. Trying to restart the previous session..." >&2
     compose up -d wrapper >/dev/null || true
     return 1
   fi
+  if [[ "$save" == 1 ]]; then save_credentials "$username" "$password"; fi
   unset password
   compose up -d wrapper
   wait_ready || die "login finished, but /status is not ready; run 'wrapper logs'"
   test_wrapper
 }
+forget_credentials() {
+  require_root
+  if [[ -e "$CREDENTIALS_FILE" ]]; then
+    rm -f "$CREDENTIALS_FILE"
+    echo "Removed $CREDENTIALS_FILE; the watchdog will only restart the container."
+  else
+    echo "No saved credentials."
+  fi
+}
+restart_wrapper() {
+  require_root
+  take_lock 900 || die "another wrapper operation is still running"
+  compose up -d --force-recreate wrapper
+  wait_ready || die "/status is not ready after restart; run 'wrapper logs'"
+  test_wrapper
+}
+
+# One watchdog cycle (run by wrapper-watchdog.timer): check /status and /m3u8; if they
+# fail twice in a row, recreate the container; if that does not help and credentials are
+# saved, log in again (at most once per RELOGIN_COOLDOWN seconds, to avoid Apple lockouts).
+watchdog_run() {
+  require_root
+  if ! take_lock 0; then
+    echo "another wrapper operation is running; skipping this check"
+    return 0
+  fi
+  healthy && return 0
+  sleep 20
+  if healthy; then
+    echo "transient failure, recovered without action"
+    return 0
+  fi
+
+  echo "unhealthy: $(test_wrapper 2>&1 | tail -n 1)"
+  echo "recreating the container..."
+  compose up -d --force-recreate wrapper || true
+  if wait_ready && healthy; then
+    echo "recovered after restart: $(check_status 2>&1)"
+    return 0
+  fi
+
+  if [[ ! -r "$CREDENTIALS_FILE" ]]; then
+    echo "still unhealthy after restart; no saved credentials, run 'sudo wrapper login --save'"
+    return 1
+  fi
+  mkdir -p "$STATE_DIR"
+  local now last username password
+  now="$(date +%s)"
+  last="$(cat "$STATE_DIR/last-relogin" 2>/dev/null || echo 0)"
+  [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  if ((now - last < RELOGIN_COOLDOWN)); then
+    echo "still unhealthy; automatic re-login skipped, last attempt was $((now - last))s ago"
+    return 1
+  fi
+  echo "$now" > "$STATE_DIR/last-relogin"
+  { IFS= read -r username && IFS= read -r password; } < "$CREDENTIALS_FILE" ||
+    { echo "cannot read $CREDENTIALS_FILE"; return 1; }
+
+  echo "still unhealthy after restart; logging in again as ${username%%@*}@..."
+  compose stop wrapper >/dev/null 2>&1 || true
+  if run_login "$username" "$password" 0; then
+    echo "login finished"
+  else
+    echo "login failed or timed out (Apple may require a 2FA code); run 'sudo wrapper login'"
+  fi
+  unset password
+  compose up -d wrapper || true
+  if wait_ready && healthy; then
+    echo "recovered after re-login: $(check_status 2>&1)"
+    return 0
+  fi
+  echo "still unhealthy after re-login; check 'sudo wrapper logs'"
+  return 1
+}
+watchdog() {
+  case "${1:-run}" in
+    run) watchdog_run ;;
+    enable) require_root; systemctl enable --now "$WATCHDOG_TIMER" ;;
+    disable) require_root; systemctl disable --now "$WATCHDOG_TIMER" ;;
+    status)
+      systemctl list-timers "$WATCHDOG_TIMER" --all --no-pager || true
+      if [[ -r "$CREDENTIALS_FILE" ]]; then
+        echo "Automatic re-login: enabled ($CREDENTIALS_FILE)"
+      else
+        echo "Automatic re-login: disabled (no saved credentials)"
+      fi
+      journalctl -u wrapper-watchdog.service -n 20 --no-pager -o short-iso 2>/dev/null || true
+      ;;
+    *) die "usage: wrapper watchdog [run|status|enable|disable]" ;;
+  esac
+}
 update_wrapper() {
   require_root
+  take_lock 900 || die "another wrapper operation is still running"
   local previous_image previous_commit current_commit staging previous_is_artifact=0
   if [[ -f "$APP_DIR/upstream/.source-commit" ]]; then
     previous_commit="$(cat "$APP_DIR/upstream/.source-commit")"
@@ -152,9 +285,15 @@ Usage: wrapper <command>
 
   wrapper status                  Check the container's authenticated regions
   wrapper logs [--follow]         Show the last 100 container log lines
-  wrapper login [USER [PASSWORD]] Log in; prompts for missing values and 2FA
+  wrapper login [--save] [USER [PASSWORD]]
+                                  Log in; prompts for missing values and 2FA.
+                                  --save keeps the credentials for automatic re-login
+  wrapper forget-credentials      Delete saved credentials (disables automatic re-login)
+  wrapper restart                 Recreate the container and test it
   wrapper update                  Download built lite, restart and test
   wrapper test [TRACK_ID]         Check /status and a real /m3u8 request
+  wrapper watchdog [run|status|enable|disable]
+                                  Run one health check, or manage the periodic watchdog
 EOF
 }
 
@@ -171,8 +310,11 @@ case "$command" in
     esac
     ;;
   login) login "$@" ;;
+  forget-credentials) [[ $# -eq 0 ]] || die "usage: wrapper forget-credentials"; forget_credentials ;;
+  restart) [[ $# -eq 0 ]] || die "usage: wrapper restart"; restart_wrapper ;;
   update) [[ $# -eq 0 ]] || die "usage: wrapper update"; update_wrapper ;;
   test) [[ $# -le 1 ]] || die "usage: wrapper test [TRACK_ID]"; test_wrapper "${1:-}" ;;
+  watchdog) [[ $# -le 1 ]] || die "usage: wrapper watchdog [run|status|enable|disable]"; watchdog "$@" ;;
   -h|--help|help|"") usage ;;
   *) usage >&2; die "unknown command: $command" ;;
 esac

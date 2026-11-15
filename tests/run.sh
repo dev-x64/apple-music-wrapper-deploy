@@ -16,7 +16,7 @@ cat > "$TEMP_DIR/bin/curl" <<'EOF'
 for argument in "$@"; do
   case "$argument" in
     */status)
-      if [[ "${MOCK_FAIL_STATUS:-0}" == 1 ]]; then
+      if [[ "${MOCK_FAIL_STATUS:-0}" == 1 && ! -e "${MOCK_HEALTHY_FLAG:-/nonexistent}" ]]; then
         printf '%s\n' '{"code":-1,"msg":"not logged in","data":null}'
       else
         printf '%s\n' '{"code":0,"msg":"SUCCESS","data":{"regions":["id"]}}'
@@ -37,7 +37,23 @@ exit 2
 EOF
 chmod +x "$TEMP_DIR/bin/curl"
 
+# docker mock: logs every call; "compose up" or "run --login" can make the API healthy.
+cat > "$TEMP_DIR/bin/docker" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$MOCK_DOCKER_LOG"
+case " $* " in
+  *" compose "*" up "*) [[ "${MOCK_RESTART_FIXES:-0}" != 1 ]] || touch "$MOCK_HEALTHY_FLAG" ;;
+  *" run "*"--login "*) [[ "${MOCK_LOGIN_FIXES:-0}" != 1 ]] || touch "$MOCK_HEALTHY_FLAG" ;;
+esac
+exit 0
+EOF
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TEMP_DIR/bin/sleep"
+printf '#!/usr/bin/env bash\nshift\nexec "$@"\n' > "$TEMP_DIR/bin/timeout"
+chmod +x "$TEMP_DIR/bin/docker" "$TEMP_DIR/bin/sleep" "$TEMP_DIR/bin/timeout"
+
 bash -n "$ROOT/install.sh" "$ROOT/wrapper"
+grep -q '@INTERVAL@' "$ROOT/wrapper-watchdog.timer.template"
+grep -q '^ExecStart=/usr/local/bin/wrapper watchdog run$' "$ROOT/wrapper-watchdog.service"
 docker compose --project-directory "$TEMP_DIR/app" --env-file "$TEMP_DIR/app/.env" \
   -f "$TEMP_DIR/app/compose.yaml" config --quiet
 
@@ -58,4 +74,47 @@ if "$ROOT/wrapper" test abc >/dev/null 2>&1; then
   echo "test accepted a nonnumeric track ID" >&2
   exit 1
 fi
-echo "CLI, failure cases, Compose and shell syntax: OK"
+
+export WRAPPER_TEST_MODE=1
+export WRAPPER_STATE_DIR="$TEMP_DIR/state"
+export WRAPPER_LOCK_FILE="$TEMP_DIR/lock"
+export WRAPPER_CREDENTIALS_FILE="$TEMP_DIR/credentials"
+export MOCK_DOCKER_LOG="$TEMP_DIR/docker.log"
+export MOCK_HEALTHY_FLAG="$TEMP_DIR/healthy"
+reset_watchdog() { rm -rf "$WRAPPER_STATE_DIR" "$MOCK_HEALTHY_FLAG" "$WRAPPER_CREDENTIALS_FILE"; : > "$MOCK_DOCKER_LOG"; }
+fail() { echo "watchdog: $*" >&2; exit 1; }
+
+reset_watchdog
+"$ROOT/wrapper" watchdog run >/dev/null || fail "healthy wrapper reported as failed"
+[[ ! -s "$MOCK_DOCKER_LOG" ]] || fail "healthy wrapper was restarted"
+
+reset_watchdog
+MOCK_FAIL_STATUS=1 MOCK_RESTART_FIXES=1 "$ROOT/wrapper" watchdog run >/dev/null ||
+  fail "restart did not recover"
+grep -q 'compose .* up -d --force-recreate wrapper' "$MOCK_DOCKER_LOG" || fail "no restart"
+! grep -q -- '--login' "$MOCK_DOCKER_LOG" || fail "logged in although restart was enough"
+
+reset_watchdog
+if MOCK_FAIL_STATUS=1 "$ROOT/wrapper" watchdog run >/dev/null; then
+  fail "reported success without credentials"
+fi
+! grep -q -- '--login' "$MOCK_DOCKER_LOG" || fail "logged in without saved credentials"
+
+reset_watchdog
+printf '%s\n%s\n' 'user@example.com' 'p@ss word' > "$WRAPPER_CREDENTIALS_FILE"
+MOCK_FAIL_STATUS=1 MOCK_LOGIN_FIXES=1 "$ROOT/wrapper" watchdog run >/dev/null ||
+  fail "re-login did not recover"
+grep -q -- '--login user@example.com:p@ss word --base-dir /data' "$MOCK_DOCKER_LOG" ||
+  fail "re-login used wrong credentials"
+rm -f "$MOCK_HEALTHY_FLAG"; : > "$MOCK_DOCKER_LOG"
+if MOCK_FAIL_STATUS=1 MOCK_LOGIN_FIXES=1 "$ROOT/wrapper" watchdog run >/dev/null; then
+  fail "second re-login was not rate-limited"
+fi
+! grep -q -- '--login' "$MOCK_DOCKER_LOG" || fail "re-login cooldown ignored"
+
+reset_watchdog
+printf 'user@example.com\nsecret\n' > "$WRAPPER_CREDENTIALS_FILE"
+"$ROOT/wrapper" forget-credentials >/dev/null
+[[ ! -e "$WRAPPER_CREDENTIALS_FILE" ]] || fail "forget-credentials kept the file"
+
+echo "CLI, watchdog, failure cases, Compose and shell syntax: OK"
